@@ -124,6 +124,141 @@ def main():
                 print(f"[ERRO] Não consegui carregar {alvo['url']}: {e}")
                 continue
 
+            # --- DEBUG: pistas pra entender o que a página realmente mostrou ---
+            print(f"  (Texto capturado: {len(texto)} caracteres)")
+            print(f"  (Amostra do início: {texto[:300]!r})")
+            # ---------------------------------------------------------------
+
+            precos = extrair_precos(texto)
+            if not precos:
+                print("  Nenhum preço encontrado.")
+                continue
+
+            mais_barato = min(precos, key=lambda x: x["preco"])
+            anterior = estado.get(chave)
+
+            deve_avisar = False
+            desconto_pct = None
+
+            if anterior is None:
+                deve_avisar = True
+            elif mais_barato["preco"] < anterior["preco"]:
+                deve_avisar = True
+                desconto_pct = round((1 - mais_barato["preco"] / anterior["preco"]) * 100, 1)
+
+            if deve_avisar:
+                linhas = [
+                    f"*🎟 Ingresso encontrado — {alvo['site']}*",
+                    f"Dia: {alvo['dia']}",
+                    f"Tipo: {mais_barato['tipo']}",
+                    f"Preço mais barato: R$ {mais_barato['preco']:.2f}".replace(".", ","),
+                ]
+                if desconto_pct is not None:
+                    linhas.append(f"Queda em relação ao último preço: {desconto_pct}%")
+                linhas.append(alvo["url"])
+                enviar_telegram("\n".join(linhas))
+                print("  -> Alerta enviado!")
+
+            estado[chave] = {
+                "preco": mais_barato["preco"],
+                "tipo": mais_barato["tipo"],
+                "atualizado_em": agora,
+            }
+
+    salvar_estado(estado)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+def parse_price(price_str: str) -> float:
+    numero = price_str.replace("R$", "").strip()
+    numero = numero.replace(".", "").replace(",", ".")
+    return float(numero)
+
+
+def guess_tipo(texto_ao_redor: str) -> str:
+    texto_lower = texto_ao_redor.lower()
+    for kw in TIPO_KEYWORDS:
+        if kw in texto_lower:
+            return kw.title()
+    return "Ingresso"
+
+
+def extrair_precos(texto_pagina: str):
+    resultados = []
+    for match in PRICE_RE.finditer(texto_pagina):
+        preco_str = match.group()
+        try:
+            preco = parse_price(preco_str)
+        except ValueError:
+            continue
+        inicio = max(0, match.start() - 60)
+        contexto = texto_pagina[inicio:match.start()]
+        tipo = guess_tipo(contexto)
+        resultados.append({"preco": preco, "tipo": tipo})
+    return resultados
+
+
+def carregar_pagina(playwright, url: str) -> str:
+    browser = playwright.chromium.launch(headless=True)
+    contexto = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        locale="pt-BR",
+    )
+    pagina = contexto.new_page()
+    try:
+        pagina.goto(url, timeout=45000, wait_until="networkidle")
+        pagina.wait_for_timeout(3000)
+        texto = pagina.inner_text("body")
+    finally:
+        browser.close()
+    return texto
+
+
+def enviar_telegram(mensagem: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[AVISO] Telegram não configurado, pulando envio.")
+        print(mensagem)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    resp = requests.post(url, data={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": mensagem,
+        "parse_mode": "Markdown",
+    })
+    if resp.status_code != 200:
+        print(f"[ERRO] Falha ao enviar Telegram: {resp.status_code} {resp.text}")
+
+
+def carregar_estado():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def salvar_estado(estado):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(estado, f, ensure_ascii=False, indent=2)
+
+
+def main():
+    estado = carregar_estado()
+    agora = datetime.now(timezone.utc).isoformat()
+
+    with sync_playwright() as p:
+        for alvo in TARGETS:
+            chave = alvo["url"]
+            print(f"Verificando {alvo['site']} - dia {alvo['dia']}...")
+            try:
+                texto = carregar_pagina(p, alvo["url"])
+            except Exception as e:
+                print(f"[ERRO] Não consegui carregar {alvo['url']}: {e}")
+                continue
+
             precos = extrair_precos(texto)
             if not precos:
                 print("  Nenhum preço encontrado.")
